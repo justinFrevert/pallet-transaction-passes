@@ -45,7 +45,7 @@ pub mod pallet {
 		_,
 		Blake2_128Concat,
 		T::AccountId,
-		PassInfo<T::BlockNumber>,
+		PassInfo<<T as frame_system::Config>::BlockNumber>,
 		OptionQuery
 	>;
 
@@ -62,17 +62,37 @@ pub mod pallet {
 		StorageOverflow,
 	}
 
-	#[derive(Debug, Encode, Decode, Clone, Eq, PartialEq, TypeInfo, MaxEncodedLen)]
+	#[derive(Debug, Encode, Decode, Clone, Eq, PartialEq, TypeInfo, MaxEncodedLen, PartialOrd)]
 	pub enum PassType {
 		// Usage(u8),   
 		Day
 		// TotalWeight,
 	}
 
-	#[derive(Encode, Decode, TypeInfo, MaxEncodedLen)]
+	#[derive(Encode, Decode, TypeInfo, MaxEncodedLen, PartialEq, Eq, PartialOrd)]
 	pub struct PassInfo<BlockNumber> {
 		pub pass_type: PassType,
 		pub expiration: BlockNumber
+	}
+
+	pub trait Pass {
+		/// Perform all checks required of a pass, deduct any held value(if any), and return the boolean result of verification
+		fn check_pass_is_valid(&self) -> bool;
+	}
+
+	impl<T: Config + PartialOrd + frame_system::Config<BlockNumber = T>> Pass for PassInfo<T> {
+		fn check_pass_is_valid(&self) -> bool {
+			match &self.pass_type {
+				&PassType::Day => {
+					if <frame_system::Pallet<T>>::block_number() > self.expiration {
+						false
+					} else {
+						true
+					}
+				},
+				// Usage, TotalWeight... include any deductions
+			}
+		}
 	}
 
 	#[pallet::call]
@@ -94,7 +114,6 @@ pub mod pallet {
 }
 
 #[derive(Encode, Decode, Clone, Eq, PartialEq, TypeInfo)]
-
 pub struct ChainPass<T: Config + Send + Sync>(PhantomData<T>);
 
 impl<T: Config + Send + Sync> ChainPass<T> {
@@ -130,21 +149,17 @@ where
 		_info: &DispatchInfoOf<Self::Call>,
 		_len: usize,
 	) -> TransactionValidity {
-		match (Pallet::<T>::get_timed_pass(who), call.is_sub_type()) {
-			// If the create chain hourly pass call is received at all, just set it as a valid tx
-			(_, Some(Call::create_chain_hourly_pass { pass_type, owner })) => {
-				Ok(ValidTransaction {
-					..Default::default()
-				})
-			},
-			// check pass expiration
-			(Some(pass), _) if <frame_system::Pallet<T>>::block_number() > pass.expiration  => {
-				Err(TransactionValidityError::Invalid(InvalidTransaction::Payment))
-			},
-			(None, _) => Err(TransactionValidityError::Invalid(InvalidTransaction::Payment)),
-			_ => Ok(ValidTransaction {
-				..Default::default()
-			})
+		match call.is_sub_type() {
+			// If they want to create a pass itself, just ignore it and let it through for now. 
+			Some(Call::create_chain_hourly_pass { .. }) => Ok(ValidTransaction { ..Default::default() }),
+			// All other tx types should be checked
+			_ => {
+				// If there is no pass found, or if that pass is invalid, return bad tx for lack of "payment"
+				match Pallet::<T>::get_timed_pass(who) {
+					Some(pass) if pass.expiration < <frame_system::Pallet<T>>::block_number() => Ok(ValidTransaction { ..Default::default() }),
+					_ => Err(TransactionValidityError::Invalid(InvalidTransaction::Payment))
+				}
+			}
 		}
 	}
 
@@ -152,22 +167,10 @@ where
 		self,
 		who: &Self::AccountId,
 		call: &Self::Call,
-		_info: &DispatchInfoOf<Self::Call>,
-		_len: usize,
+		info: &DispatchInfoOf<Self::Call>,
+		len: usize,
 	) -> Result<Self::Pre, TransactionValidityError> {
-
-		match (Pallet::<T>::get_timed_pass(who), call.is_sub_type()) {
-			// If the create chain hourly pass call is received at all, just set it as a valid tx
-			(_, Some(Call::create_chain_hourly_pass { pass_type, owner })) => {
-				Ok(())
-			},
-			// check pass expiration
-			(Some(pass), _) if <frame_system::Pallet<T>>::block_number() > pass.expiration  => {
-				Err(TransactionValidityError::Invalid(InvalidTransaction::Payment))
-			},
-			(None, _) => Err(TransactionValidityError::Invalid(InvalidTransaction::Payment)),
-			_ => Ok(())
-		}
+		Self::validate(&self, who, call, info, len).map(|_| ())
 	}
 
 	fn post_dispatch(
